@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>02 :: Remove Server from MCE</title>
+<style>
+  :root{
+    --bg:#0e0e11; --panel:#16161b; --line:#2c2c35; --ink:#e6e6ec; --dim:#8b8b99;
+    --accent:#4da3ff; --ok:#3ecf8e; --warn:#e8b339; --vm:#b57bff; --bm:#58c7d8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 "Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{padding:18px 24px 10px;border-bottom:1px solid var(--line)}
+  h1{margin:0;font-size:19px;font-weight:600;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:13px;margin-top:4px;max-width:900px}
+  .wrap{display:flex;align-items:stretch;min-height:700px}
+  .stage{flex:1;padding:14px 10px 12px 18px;display:flex;flex-direction:column;min-width:0}
+  #svg{width:100%;height:400px;flex:0 0 auto}
+  .detail{margin-top:10px;border:1px solid var(--line);border-radius:8px;background:#121217;
+          padding:11px 14px;flex:1;min-height:210px;max-height:350px;overflow:auto}
+  .dh{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;
+      margin:0 0 8px;font-weight:600}
+  .k{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:1px;
+     display:block;margin:9px 0 3px}
+  .k:first-of-type{margin-top:0}
+  .detail pre{margin:0;white-space:pre-wrap;word-break:break-word;
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       font-size:11.5px;line-height:1.55;color:#cfd3da}
+  pre.call{color:var(--accent)}
+  pre.warn{color:var(--warn)}
+  .empty{color:var(--dim);font-style:italic;font-size:12.5px}
+  .side{width:366px;border-left:1px solid var(--line);background:var(--panel);
+        padding:14px 16px;overflow-y:auto;max-height:770px}
+  .side h2{font-size:12px;text-transform:uppercase;letter-spacing:1.2px;
+           color:var(--dim);margin:0 0 10px;font-weight:600}
+  .step{padding:8px 10px;border-radius:6px;cursor:pointer;display:flex;gap:9px;
+        border:1px solid transparent;margin-bottom:3px}
+  .step:hover{background:#1e1e25}
+  .step.on{background:#1b2838;border-color:var(--accent)}
+  .step.off{opacity:.3}
+  .num{color:var(--dim);font-variant-numeric:tabular-nums;min-width:22px;font-size:12px}
+  .step.on .num{color:var(--accent)}
+  .txt{flex:1}
+  .nm{font-weight:500;display:block}
+  .nt{color:var(--dim);font-size:12px;margin-top:2px;display:block}
+  .tag{font-size:10px;padding:1px 6px;border-radius:99px;border:1px solid var(--line);
+       color:var(--dim);align-self:flex-start;margin-top:2px}
+  .tag.VM{color:var(--vm);border-color:var(--vm)}
+  .tag.BM{color:var(--bm);border-color:var(--bm)}
+  .tag.IPMI{color:var(--warn);border-color:var(--warn)}
+  footer{display:flex;gap:10px;align-items:center;padding:12px 18px;
+         border-top:1px solid var(--line);flex-wrap:wrap}
+  button{background:#1e1e25;color:var(--ink);border:1px solid var(--line);
+         border-radius:6px;padding:7px 14px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--accent)}
+  button.pri{background:var(--accent);border-color:var(--accent);color:#06121f;font-weight:600}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .seg button{border:0;border-radius:0}
+  .seg button.sel{background:#2a3a4d;color:var(--accent)}
+  .spacer{flex:1}
+  .caption{color:var(--dim);font-size:12px}
+  text{font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .node rect{fill:#191920;stroke:var(--line);stroke-width:1.5;rx:8}
+  .node.hot rect{stroke:var(--accent);stroke-width:2.5;fill:#1b2838}
+  .node.done rect{stroke:#2f5d48}
+  .node text{fill:var(--ink);font-size:13px;font-weight:500}
+  .node tspan.s{fill:var(--dim);font-size:11px;font-weight:400}
+  .group rect{fill:none;stroke:var(--line);stroke-dasharray:4 4;rx:10}
+  .group text{fill:var(--dim);font-size:11px;letter-spacing:1px}
+  .edge{stroke:#3a3a46;stroke-width:1.5;fill:none}
+  .edge.hot{stroke:var(--accent);stroke-width:2.5}
+  .elab{fill:var(--accent);font-size:11.5px;font-weight:500}
+  #dot{fill:var(--accent);filter:drop-shadow(0 0 6px var(--accent))}
+</style>
+</head>
+<body>
+<header>
+  <h1>02 :: Remove Server from MCE</h1>
+  <div class="sub">Only runs when a pool has been <em>above</em> its ceiling for the cooldown. A tenant scaling down returns agents to the pool; it does not come here.</div>
+</header>
+
+<div class="wrap">
+  <div class="stage">
+    <svg id="svg" viewBox="0 0 1000 560"
+         xmlns="http://www.w3.org/2000/svg" aria-label="Workflow diagram"></svg>
+    <div class="detail" id="detail"></div>
+  </div>
+  <aside class="side">
+    <h2>Steps</h2>
+    <div id="steps"></div>
+  </aside>
+</div>
+
+<footer>
+  <button class="pri" id="play">Play</button>
+  <button id="prev">Prev</button>
+  <button id="next">Next</button>
+  <button id="rst">Restart</button>
+  <span id="modes" style="display:none">
+    <span class="caption">Pool</span>
+    <span class="seg">
+      <button id="mBM" class="sel">Bare metal</button>
+      <button id="mVM">Virtual</button>
+    </span>
+  </span>
+  <div class="spacer"></div>
+  <span class="caption" id="cap"></span>
+</footer>
+
+<script>
+const NODES = {
+  "tmp": {
+    "x": 390,
+    "y": 18,
+    "w": 220,
+    "h": 50,
+    "t": "Temporal",
+    "s": "remove-server-<infraenv>"
+  },
+  "scan": {
+    "x": 800,
+    "y": 18,
+    "w": 170,
+    "h": 54,
+    "t": "server-scan",
+    "s": "fleet inventory"
+  },
+  "pxe": {
+    "x": 30,
+    "y": 130,
+    "w": 170,
+    "h": 54,
+    "t": "PXE Host",
+    "s": "per site"
+  },
+  "vm": {
+    "x": 800,
+    "y": 148,
+    "w": 170,
+    "h": 54,
+    "t": "Virtual Machine",
+    "s": "destroyed"
+  },
+  "ctl": {
+    "x": 266,
+    "y": 312,
+    "w": 204,
+    "h": 48,
+    "t": "Inventory Controller",
+    "s": "in-cluster"
+  },
+  "res": {
+    "x": 500,
+    "y": 312,
+    "w": 234,
+    "h": 48,
+    "t": "BMH + NMState",
+    "s": "+ BMC Secret"
+  },
+  "agt": {
+    "x": 266,
+    "y": 384,
+    "w": 204,
+    "h": 46,
+    "t": "Agent",
+    "s": "must be unbound"
+  },
+  "gone": {
+    "x": 500,
+    "y": 384,
+    "w": 234,
+    "h": 46,
+    "t": "Verified gone",
+    "s": "nothing survives"
+  }
+};
+const GROUPS = [
+  {
+    "x": 778,
+    "y": 110,
+    "w": 214,
+    "h": 116,
+    "label": "KV CLUSTER"
+  },
+  {
+    "x": 240,
+    "y": 270,
+    "w": 520,
+    "h": 200,
+    "label": "MCE HUB  \u00b7  controller and worker run in-cluster"
+  }
+];
+const RAW   = [
+  [
+    "ctl",
+    "tmp",
+    "both",
+    "Signal lower target",
+    "Above ceiling, sustained through the cooldown.",
+    {
+      "call": "Temporal SignalWithStart",
+      "send": "workflow_id : remove-server-cisco-m6-64c-512gb\nsignal      : setTarget\npayload     : { \"target_total\": 9 }",
+      "warn": "Only fires when total > demand + highPct, held for the whole cooldown. A\ntenant scaling down does NOT come here: those agents just unbind."
+    }
+  ],
+  [
+    "tmp",
+    "agt",
+    "both",
+    "Pick an unbound agent",
+    "Prefer the longest idle. None selectable is a clean no-op.",
+    {
+      "call": "LIST agent-install.openshift.io/v1beta1 Agent",
+      "recv": "filter: spec.clusterDeploymentName is empty\norder:  longest idle first",
+      "warn": "Never pick a bound agent. It is carrying a tenant workload."
+    }
+  ],
+  [
+    "tmp",
+    "agt",
+    "both",
+    "Re-check it is unbound",
+    "A NodePool can claim it at any instant. This is the race.",
+    {
+      "call": "GET agent-install.openshift.io/v1beta1 Agent/<name>",
+      "recv": "spec.clusterDeploymentName must STILL be empty",
+      "warn": "Read it again immediately before the destructive step. The gap between\nselecting and destroying is exactly where a NodePool can claim it."
+    }
+  ],
+  [
+    "tmp",
+    "res",
+    "both",
+    "Detach the host",
+    "Before any delete, or the finalizer blocks forever.",
+    {
+      "call": "PATCH metal3.io/v1alpha1 BareMetalHost/<name>",
+      "send": "metadata.annotations:\n  baremetalhost.metal3.io/detached: \"\"",
+      "warn": "This is the load-bearing step. Delete first and Metal3's finalizer tries to\ndeprovision through a BMC that is no longer answering, and blocks forever.\nMeasured at 14 hours with no error reported."
+    }
+  ],
+  [
+    "tmp",
+    "res",
+    "both",
+    "Delete NMState, BMH, Secret",
+    "In that order. A missing object is success.",
+    {
+      "call": "DELETE NMStateConfig, then BareMetalHost, then Secret",
+      "recv": "404 on any of them is success, not an error",
+      "warn": "A successful delete call does NOT mean the object is gone; finalizers can\nhold it. Confirming is the next two steps' job."
+    }
+  ],
+  [
+    "res",
+    "gone",
+    "both",
+    "Clear the one finalizer",
+    "Only metal3's. Never the whole list.",
+    {
+      "call": "PATCH BareMetalHost finalizers, after a bounded wait",
+      "send": "remove only: baremetalhost.metal3.io\nleave every other finalizer in place",
+      "warn": "Clearing the whole list strips finalizers belonging to other controllers\nand leaks whatever they were protecting."
+    }
+  ],
+  [
+    "tmp",
+    "gone",
+    "both",
+    "Verify all three gone",
+    "Anything surviving is a retryable failure.",
+    {
+      "call": "GET each of the three",
+      "recv": "all three must 404",
+      "warn": "The machine is NOT returned to inventory while a BareMetalHost still points\nat it. Verification, not the delete calls, decides the run is done."
+    }
+  ],
+  [
+    "tmp",
+    "pxe",
+    "IPMI",
+    "Unmap the boot MAC",
+    "Mirror of the mapping on the way in.",
+    {
+      "call": "DELETE /pxe-map/<boot-mac>",
+      "recv": "404 is success"
+    }
+  ],
+  [
+    "tmp",
+    "vm",
+    "VM",
+    "Delete the VM",
+    "Releases hypervisor CPU, memory and storage.",
+    {
+      "call": "DELETE kubevirt.io/v1 VirtualMachine   (on the KV cluster's queue)",
+      "warn": "BEING IMPLEMENTED. With no overcommit at the hypervisor layer, this is what\nactually returns the CPU and memory; until it runs they stay reserved."
+    }
+  ],
+  [
+    "tmp",
+    "scan",
+    "BM",
+    "Release the lock",
+    "No endpoint sets a machine available; the status job notices.",
+    {
+      "call": "DELETE /servers/{id}/reservation",
+      "send": "{ \"holder\": \"remove-server\", \"workflow_id\": \"...\" }",
+      "warn": "There is NO endpoint that marks a server available. A status job on the hub\nnotices the Agent has gone, every 15 minutes, and sets it. You cannot push\nit, so do not design a step that tries."
+    }
+  ],
+  [
+    "gone",
+    "ctl",
+    "both",
+    "Re-read, loop or stop",
+    "Still above target? Go again. Else complete.",
+    {
+      "call": "LIST NodePool + Agent on this hub   (in-cluster)",
+      "recv": "total = assigned + spare + building",
+      "warn": "Never shrink below target. The target is a floor as well as a ceiling."
+    }
+  ]
+];
+const HAS_MODES = true;
+const STEPS = RAW.map(r => ({f:r[0], t:r[1], b:r[2], n:r[3], d:r[4], x:r[5]||null}));
+const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+function showDetail(s){
+  const box=document.getElementById("detail");
+  if(!s){ box.innerHTML='<div class="dh">Exchange</div>'+
+      '<div class="empty">Pick a step, or press play.</div>'; return; }
+  if(!s.x){ box.innerHTML='<div class="dh">Exchange &mdash; '+esc(s.n)+'</div>'+
+      '<div class="empty">Not documented yet for this step.</div>'; return; }
+  let h='<div class="dh">Exchange &mdash; '+esc(s.n)+'</div>';
+  if(s.x.call) h+='<span class="k">Call</span><pre class="call">'+esc(s.x.call)+'</pre>';
+  if(s.x.send) h+='<span class="k">Sends</span><pre>'+esc(s.x.send)+'</pre>';
+  if(s.x.recv) h+='<span class="k">Receives</span><pre>'+esc(s.x.recv)+'</pre>';
+  if(s.x.warn) h+='<span class="k">Watch out</span><pre class="warn">'+esc(s.x.warn)+'</pre>';
+  box.innerHTML=h;
+}
+
+const svg = document.getElementById("svg");
+const NS = "http://www.w3.org/2000/svg";
+const el = (n,a={}) => { const e=document.createElementNS(NS,n);
+  for(const k in a) e.setAttribute(k,a[k]); return e; };
+const cx = n => NODES[n].x + NODES[n].w/2;
+const cy = n => NODES[n].y + NODES[n].h/2;
+
+let mode="BM", idx=-1, playing=false, timer=null;
+const vis = s => s.b==="both" || s.b===mode || (s.b==="IPMI" && mode==="BM");
+const active = () => STEPS.map((s,i)=>i).filter(i=>vis(STEPS[i]));
+
+function drawStatic(){
+  svg.innerHTML="";
+  GROUPS.forEach(G=>{
+    const g = el("g",{class:"group"});
+    g.appendChild(el("rect",{x:G.x,y:G.y,width:G.w,height:G.h}));
+    const gt = el("text",{x:G.x+14,y:G.y+20}); gt.textContent=G.label;
+    g.appendChild(gt); svg.appendChild(g);
+  });
+  svg.appendChild(el("g",{id:"edges"}));
+  for(const k in NODES){
+    const d=NODES[k];
+    const n=el("g",{class:"node",id:"n_"+k});
+    n.appendChild(el("rect",{x:d.x,y:d.y,width:d.w,height:d.h}));
+    const t=el("text",{x:d.x+d.w/2,y:d.y+d.h/2-3,"text-anchor":"middle"});
+    t.textContent=d.t;
+    if(d.s){ const s=el("tspan",{x:d.x+d.w/2,dy:"15",class:"s"}); s.textContent=d.s;
+             t.appendChild(s); }
+    n.appendChild(t); svg.appendChild(n);
+  }
+  svg.appendChild(el("circle",{id:"dot",r:7,opacity:0}));
+}
+
+function path(a,b){
+  if(a===b){ // self-loop: below the node when it sits near the top edge
+    const d=NODES[a], x=cx(a);
+    if(d.y < 72){ const y=d.y+d.h;
+      return `M ${x-28} ${y} C ${x-40} ${y+46} ${x+40} ${y+46} ${x+28} ${y}`; }
+    const y=d.y;
+    return `M ${x-28} ${y} C ${x-40} ${y-46} ${x+40} ${y-46} ${x+28} ${y}`;
+  }
+  const x1=cx(a), y1=cy(a), x2=cx(b), y2=cy(b);
+  const mx=(x1+x2)/2, my=(y1+y2)/2;
+  const dx=x2-x1, dy=y2-y1, len=Math.hypot(dx,dy)||1;
+  const bow=Math.min(46,len*0.12);
+  return `M ${x1} ${y1} Q ${mx - dy/len*bow} ${my + dx/len*bow} ${x2} ${y2}`;
+}
+
+function render(){
+  document.querySelectorAll(".node").forEach(n=>n.classList.remove("hot","done"));
+  const edges=document.getElementById("edges"); edges.innerHTML="";
+  document.getElementById("dot").setAttribute("opacity",0);
+
+  const act=active(), here=act.indexOf(idx);
+  act.forEach((si,pos)=>{ if(here>=0 && pos<here)
+    document.getElementById("n_"+STEPS[si].t)?.classList.add("done"); });
+
+  if(idx>=0 && STEPS[idx]){
+    const s=STEPS[idx];
+    const p=el("path",{class:"edge hot",d:path(s.f,s.t)});
+    edges.appendChild(p);
+    document.getElementById("n_"+s.f).classList.add("hot");
+    document.getElementById("n_"+s.t).classList.add("hot");
+
+    const total=p.getTotalLength();
+    const mid=p.getPointAtLength(total*0.5);
+    const a=p.getPointAtLength(Math.max(0,total*0.5-6));
+    const b=p.getPointAtLength(Math.min(total,total*0.5+6));
+    const tx=b.x-a.x, ty=b.y-a.y, tl=Math.hypot(tx,ty)||1;
+    const off=16, lx=mid.x+(-ty/tl*off), ly=mid.y+(tx/tl*off);
+    const w=s.n.length*6.4+14;
+    edges.appendChild(el("rect",{x:lx-w/2,y:ly-11,width:w,height:18,rx:4,
+      fill:"#0e0e11",stroke:"#2c2c35","stroke-width":1}));
+    const lab=el("text",{x:lx,y:ly+2,"text-anchor":"middle",class:"elab"});
+    lab.textContent=s.n; edges.appendChild(lab);
+
+    const dot=document.getElementById("dot");
+    dot.setAttribute("opacity",1);
+    const t0=performance.now(), dur=900;
+    (function anim(now){
+      const k=Math.min(1,(now-t0)/dur);
+      const pt=p.getPointAtLength(total*k);
+      dot.setAttribute("cx",pt.x); dot.setAttribute("cy",pt.y);
+      if(k<1) requestAnimationFrame(anim);
+    })(t0);
+  }
+
+  document.querySelectorAll(".step").forEach(n=>{
+    const i=+n.dataset.i;
+    n.classList.toggle("on", i===idx);
+    n.classList.toggle("off", !vis(STEPS[i]));
+  });
+  showDetail(idx>=0 ? STEPS[idx] : null);
+  document.getElementById("cap").textContent =
+    idx<0 ? act.length+" steps" : "Step "+(act.indexOf(idx)+1)+" of "+act.length;
+}
+
+function buildList(){
+  const box=document.getElementById("steps"); box.innerHTML="";
+  STEPS.forEach((s,i)=>{
+    const d=document.createElement("div");
+    d.className="step"; d.dataset.i=i;
+    d.innerHTML='<span class="num">'+(i+1)+'</span><span class="txt">'+
+      '<span class="nm">'+s.n+'</span><span class="nt">'+s.d+'</span></span>'+
+      (s.b!=="both"?'<span class="tag '+s.b+'">'+s.b+'</span>':'');
+    d.onclick=()=>{ if(vis(s)){ idx=i; stop(); render(); } };
+    box.appendChild(d);
+  });
+}
+
+function go(dir){
+  const act=active(); if(!act.length) return;
+  let p=act.indexOf(idx);
+  p = p<0 ? (dir>0?0:act.length-1) : p+dir;
+  if(p>=act.length){ stop(); idx=act[act.length-1]; render(); return; }
+  if(p<0) p=0;
+  idx=act[p]; render();
+  document.querySelector('.step[data-i="'+idx+'"]')
+    ?.scrollIntoView({block:"nearest",behavior:"smooth"});
+}
+function stop(){ playing=false; clearInterval(timer);
+  document.getElementById("play").textContent="Play"; }
+function play(){
+  if(playing){ stop(); return; }
+  playing=true; document.getElementById("play").textContent="Pause";
+  const act=active();
+  if(idx===act[act.length-1]) idx=-1;
+  go(1);
+  timer=setInterval(()=>{ const a=active();
+    if(idx===a[a.length-1]){ stop(); return; } go(1); },1600);
+}
+function setMode(m){
+  mode=m; stop(); idx=-1;
+  document.getElementById("mBM").classList.toggle("sel",m==="BM");
+  document.getElementById("mVM").classList.toggle("sel",m==="VM");
+  render();
+}
+
+document.getElementById("play").onclick=play;
+document.getElementById("next").onclick=()=>{stop();go(1)};
+document.getElementById("prev").onclick=()=>{stop();go(-1)};
+document.getElementById("rst").onclick=()=>{stop();idx=-1;render()};
+if(HAS_MODES){
+  document.getElementById("modes").style.display="";
+  document.getElementById("mBM").onclick=()=>setMode("BM");
+  document.getElementById("mVM").onclick=()=>setMode("VM");
+}
+document.addEventListener("keydown",e=>{
+  if(e.key==="ArrowRight"){stop();go(1)} if(e.key==="ArrowLeft"){stop();go(-1)}
+  if(e.key===" "){e.preventDefault();play()}
+});
+
+// Build FIRST. setMode() calls render(), which needs the SVG and the step list
+// to exist — doing this earlier throws and aborts the rest of the script.
+drawStatic(); buildList();
+
+// Deep link: #step=7, and #vm to open on the virtual branch. Mode before step,
+// because switching mode resets the position.
+(function(){
+  const h=location.hash.slice(1);
+  if(HAS_MODES && /vm/i.test(h)) setMode("VM");
+  const m=h.match(/step=(\d+)/);
+  if(m){ const i=+m[1]-1; if(STEPS[i] && vis(STEPS[i])) idx=i; }
+})();
+
+render();
+</script>
+</body>
+</html>
