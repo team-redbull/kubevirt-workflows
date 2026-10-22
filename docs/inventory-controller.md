@@ -34,13 +34,16 @@ wrong size. One code path handles all of them.
 
 Every pass, default two minutes, for each pool on the hub:
 
-1. **Read demand.** Sum the desired replicas of every NodePool using this node type and zone.
+1. **Read demand.** Sum the desired replicas of every NodePool drawing on this pool.
 2. **Read supply.** Count agents, both spare and assigned.
-3. **Compute the target.** Demand plus a buffer.
-4. **Signal Temporal** with the target, then move on.
+3. **Read what is already building.** Ask Temporal which runs for this pool are still open.
+4. **Compute the target**, demand plus a buffer, then subtract everything in steps 2 and 3
+   to get what is still needed.
+5. **Nothing needed? Stay silent.** Otherwise ask for that many, and move on.
 
 The controller never blocks and never remembers what it asked for. Every pass starts from
-scratch.
+scratch, which is why it can be restarted at any moment and why a missed pass costs one
+cycle rather than leaving anything inconsistent.
 
 ---
 
@@ -53,36 +56,43 @@ Read from the cluster, per pool:
 | `demand` | Sum of desired replicas across the NodePools in this pool |
 | `assigned` | Agents assigned to a NodePool |
 | `spare` | Agents registered and unassigned. A VM mid-scrub must not appear here. |
+| `running` | Open runs for this pool, from Temporal. Machines being built are not Agents yet. |
 
 Then:
 
 ```
-total   = assigned + spare          <- what the controller can see
-
 low     = max(minFree, round(lowPct  × demand))
 high    = max(maxFree, round(highPct × demand))
 
 target  = demand + low
 ceiling = demand + high
 
-grow    if  total < target                      ->  act immediately
-hold    if  target <= total <= ceiling
-shrink  if  total > ceiling, held for cooldown  ->  act
+total   = assigned + spare
+needed  = target - (total + running)
+
+grow    if  needed > 0                          ->  ask for `needed`, immediately
+hold    if  needed <= 0 and total <= ceiling    ->  say nothing at all
+shrink  if  total > ceiling, held for cooldown  ->  ask for the surplus to go
 ```
 
-Everything is in the same unit: whole agents in the pool. The signal always carries `target`.
-The gap only decides *whether* to speak, never what to say.
+Everything is in the same unit: whole agents in the pool.
 
-**The controller cannot see work in flight, and that is fine.** A machine being built is not
-yet an Agent, so for the whole twenty minutes of a build the controller keeps computing the
-same shortfall and keeps sending the same target. Every one of those is absorbed, because
-the workflow subtracts its own count of running children before acting. In-flight is
-workflow state and lives nowhere the controller could read it.
+**Subtracting `running` is not optional.** The route that starts work is **additive**: it
+starts the number of new runs you ask for. Ask for two every two minutes through a
+twenty-minute build and you get twenty machines for a shortfall of two. The controller is
+the only thing positioned to prevent that, because it is the one deciding whether to speak
+at all.
 
-**Notice the target never touches the agent count.** It is a function of demand and
-configuration alone. That is what makes a stale reading of the pool harmless: it can cause
-an unnecessary signal or a missed one, but it cannot corrupt the number. A delta would carry
-the error straight into machines built.
+**In-flight work is discoverable, which is why there is no parent workflow.** Runs for a pool
+are named by slot, `install-server-<infraenv>_1` upward, so "how many are building" is a
+question anyone can ask Temporal. An earlier design had a parent workflow holding that count
+in memory, where only it could see it and where a crash lost it. Naming beats bookkeeping.
+
+**Only the ask is a delta. The thinking is absolute.** The target is computed from demand and
+configuration, converted to a count at the last moment, immediately after a live read. That
+matters because the target never touches the agent count, so a stale reading cannot corrupt
+it: it can cause an unnecessary ask or a missed one, but not a wrong number. A delta computed
+minutes earlier and buffered would carry the error straight into machines built.
 
 **Attributing demand to a pool is the part that needs care.** A NodePool claims agents
 through its label selector, so the only honest test of whether its replicas are demand on
@@ -127,28 +137,35 @@ total = 26   above ceiling, held   ->  remove 4, back down to 22
 
 ## Talking to Temporal
 
-One long-running workflow per pool.
+No parent workflow. One run per machine, in numbered slots.
 
 | | |
 |---|---|
-| Workflow ID | `inventory-{hub}-{nodetype}-{zone}` |
-| Started with | `SignalWithStart`, every pass |
-| Signal | `setTarget { target }` |
+| Read in-flight | Temporal: open runs matching `install-server-<infraenv>_*` |
+| Ask for more | `POST /workflows/server-lifecycle/install-server/bulk` |
+| Body | `{ infra_env, mce_cluster, count: needed }` |
+| Reply | 202 with a per-slot report: started, already running, or failed |
 
 Four rules:
 
-- **The ID is fixed per pool.** Never put the target in the ID. If the ID changes when the
-  target changes, Temporal has nothing to match against and every pass creates a new workflow.
-- **The signal carries a total, not a delta.** Repeating the same target is a no-op, so a
-  two-minute pass costs nothing when nothing has changed.
-- **The workflow owns in-flight work.** It knows how many VMs it is already building and
-  provisions only `target − total`. This is what stops a two-minute
-  pass from double-ordering during a twenty-minute build.
-- **One workflow does both directions.** The same workflow grows and shrinks its pool, so a
-  build and a teardown can never race.
+- **`count` is additive.** It starts that many **new** runs. It is not a target and the route
+  will not reconcile to one. Subtracting `running` before asking is the controller's job, and
+  nothing downstream will catch the mistake.
+- **Slots deduplicate, ids do not need to.** The route walks slots from `_1` upward and steps
+  over any whose run is still going, because Temporal allows one running workflow per id. A
+  finished slot is free again.
+- **Nothing owns convergence, deliberately.** A failed slot leaves the gap open and the next
+  pass sees it. The evaluation cycle **is** the retry, which is why there is no pool-level
+  attempt counter anywhere.
+- **Both directions still belong together.** Growing and shrinking one pool must not run at
+  once, or a build races a teardown over the same machines.
 
-A Temporal task queue routes work to workers. It does not deduplicate. Deduplication comes
-from the workflow ID.
+Two runs cannot take one machine. Each takes the inventory's reservation lock before writing
+anything, granted by compare-and-set and refused to any other run id, and a run that loses
+skips that candidate. That lock is what made serialising a pool unnecessary in the first
+place.
+
+A Temporal task queue routes work to workers. It does not deduplicate, and it holds no logic.
 
 ---
 
@@ -180,12 +197,12 @@ The values above are placeholders. See the last section.
 | Works per pool, not per tenant | The InfraEnv is already shared per node type and zone. Bulk requests fall out for free. |
 | Ignores what caused the demand | Modelled on Kubernetes. One code path instead of one per cause. |
 | Reads state, never events | Restart recovery is a single pass. Nothing to replay, nothing to miss. |
-| Sends a target, not a delta | A delta means remembering what you sent. A target means the controller holds no state at all. |
-| Stable workflow ID per pool | This is the entire deduplication mechanism. |
+| Thinks in targets, asks in counts | The target comes from demand and configuration, so a stale agent reading cannot corrupt it. It becomes a count only at the last moment, immediately after a live read, because the route that starts work is additive. |
+| One run per machine, in numbered slots | Deduplication is one running workflow per slot id. In-flight is then a question anyone can ask Temporal, rather than a number a parent holds in memory and loses on a crash. |
 | Target is total pool size, measured off demand | Sizing off assigned agents hides the shortfall whenever a NodePool is not full. |
 | Percentage with an absolute floor | The percentage scales with the pool. The floor keeps small and empty pools usable. |
 | Grow now, shrink slowly | Shrinking late wastes a little capacity. Growing late stalls a tenant. |
-| One workflow per pool, both directions | Single writer. No grow-versus-shrink race. |
+| Grow and shrink never overlap on one pool | A build racing a teardown over the same machines has no good outcome. |
 | Never in the tenant's request path | A controller outage slows replenishment. It does not fail tenant requests. |
 
 ---

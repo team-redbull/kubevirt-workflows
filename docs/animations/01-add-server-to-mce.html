@@ -77,7 +77,7 @@
 <body>
 <header>
   <h1>01 :: Add Server to MCE</h1>
-  <div class="sub">One workflow, two pools. Only the <em>acquire</em> differs: bare metal takes an existing machine, virtual creates one. Everything after is identical.</div>
+  <div class="sub">One run adds one machine. Filling a pool is N parallel runs in numbered slots. Both pool types draw the same way; only the empty-draw response differs.</div>
 </header>
 
 <div class="wrap">
@@ -132,7 +132,7 @@ const NODES = {
     "w": 210,
     "h": 46,
     "t": "Temporal",
-    "s": "brain \u00b7 no credentials"
+    "s": "bulk route \u00b7 slot runs"
   },
   "scan": {
     "x": 815,
@@ -156,7 +156,7 @@ const NODES = {
     "w": 156,
     "h": 42,
     "t": "VirtualMachine",
-    "s": "created on demand"
+    "s": "only if draw is empty"
   },
   "pxe": {
     "x": 20,
@@ -220,33 +220,82 @@ const GROUPS = [
     "y": 250,
     "w": 530,
     "h": 290,
-    "label": "MCE HUB  \u00b7  every activity below runs on this hub's worker"
+    "label": "MCE HUB"
   }
 ];
 const RAW   = [
   [
     "ctl",
+    "agt",
+    "both",
+    "Count the pool",
+    "The controller looks. Nothing tells it.",
+    {
+      "call": "LIST agent-install.openshift.io/v1beta1 Agent\n  namespace: <infraenv namespace>\n  label:     infraenvs.agent-install.openshift.io=<infra_env>",
+      "recv": "assigned = those with spec.clusterDeploymentName set   -> 9\nspare    = those with it empty                         -> 1",
+      "warn": "In-cluster read, its own ServiceAccount. NOT from the inventory: that\nlearns a machine is claimed from a job running every 15 minutes, far too\nstale for this. The Agent resource is the only current source."
+    }
+  ],
+  [
+    "ctl",
     "tmp",
     "both",
-    "Signal target",
-    "Absolute pool size, not a delta. Same target twice is a no-op.",
+    "Ask how many runs are open",
+    "In-flight is discoverable, not private.",
     {
-      "call": "Temporal SignalWithStart",
-      "send": "workflow_id : add-server-cisco-m6-64c-512gb\ntask_queue  : server-lifecycle-ocp4-prod-mce-bat-yam\nsignal      : setTarget\npayload     : { \"target_total\": 12 }",
-      "warn": "The id is the pool and nothing else. Put the target in the id and every\nnew target makes a new workflow, so Temporal has nothing to dedup."
+      "call": "Temporal: list open workflows matching install-server-<infra_env>_*",
+      "recv": "running = 0",
+      "warn": "This is why there is no parent workflow. Naming the runs by slot turns\n\"how many are building\" into a question anyone can ask. A parent would\nhave held that count in memory, where only it could see it and where a\ncrash loses it."
+    }
+  ],
+  [
+    "ctl",
+    "ctl",
+    "both",
+    "Compute what is needed",
+    "Policy meets observation. No I/O.",
+    {
+      "call": "no call \u2014 the controller's own arithmetic",
+      "send": "target  = demand + buffer      = 10 + 2 = 12     (from its ConfigMap)\nneeded  = target - (assigned + spare + running)\n        = 12     - (9        + 1     + 0)       = 2",
+      "warn": "The target never touches the agent count: it is demand plus configuration.\nThat is what makes a stale reading harmless. The agent count is used only\nhere, to turn the target into a count, immediately before the call.\n\nneeded <= 0 -> stay silent. No traffic on a steady fleet."
+    }
+  ],
+  [
+    "ctl",
+    "tmp",
+    "both",
+    "Start N runs",
+    "POST install-server/bulk with count = 2.",
+    {
+      "call": "POST /workflows/server-lifecycle/install-server/bulk",
+      "send": "{ \"infra_env\": \"cisco-m6-64c-512gb\",\n  \"mce_cluster\": \"ocp4-prod-mce-bat-yam\",\n  \"count\": 2 }",
+      "recv": "202, a per-slot report: started / already_running / failed",
+      "warn": "COUNT IS ADDITIVE, not a target. It starts that many NEW runs, and sending\nthe same count again while the batch is installing ADDS to it. That is\ndeliberate for an operator calling by hand. A controller must therefore\nsubtract the running slots first, which is what the previous step did."
+    }
+  ],
+  [
+    "tmp",
+    "tmp",
+    "both",
+    "Walk the slots",
+    "_1 upward, stepping over whatever is busy.",
+    {
+      "call": "start workflow  install-server-<infra_env>_1,  then _2, ...",
+      "recv": "an already-started error means that slot is busy: count it, move on",
+      "warn": "A finished slot is free again, because Temporal reuses the id of a closed\nrun. Two requests at once cannot start one slot twice: one running\nworkflow per id, and the loser moves on.\n\ncandidate_count defaults to min(20, busy + count + 2). Every run draws\nfrom the SAME top of the available list, so each needs enough spares to\nstep over what its siblings have locked. Without that headroom most of a\nparallel batch fails on the lock."
     }
   ],
   [
     "tmp",
     "hubw",
     "both",
-    "Ask the hub what exists",
-    "A real call, and the one that teaches the mechanism.",
+    "Each run dispatches to the hub",
+    "From here on, one run, one machine.",
     {
-      "call": "ExecuteActivity count_pool\n  ->  queue  server-lifecycle-activity-ocp4-prod-mce-bat-yam",
-      "send": "{ \"hub\":        \"ocp4-prod-mce-bat-yam\",\n  \"infra_env\":  \"cisco-m6-64c-512gb\",\n  \"namespace\":  \"openshift-machine-api\" }\n\nPool identifiers. The TARGET is not sent. It never leaves the workflow.",
-      "recv": "{ \"assigned\": 9, \"spare\": 1 }\n\nThe worker listed the Agents in this InfraEnv, split them on whether\nspec.clusterDeploymentName is set, returned two numbers, and went back\nto polling.\n\nThe workflow then computes, with no I/O:   needed = 12 - (9+1+0) = 2",
-      "warn": "A queue is an ADDRESS, not a component. It holds no logic and makes no\ndecisions, and the target never travels to it. The worker knows nothing\nabout the target, the pool size or the loop: one named function, typed\narguments in, typed result out.\n\nWhy the split exists: a workflow is REPLAYED from its event history after\nany crash, so it must be deterministic. The sandbox blocks network, clock\nand randomness, and it holds no credentials. Every outside call is an\nACTIVITY, run by a worker inside the cluster it talks to. On replay the\nactivity is NOT re-run; the recorded result is read back.\n\nEvery arrow after this one starts at a WORKER, never at Temporal."
+      "call": "ExecuteActivity  ->  queue server-lifecycle-activity-ocp4-prod-mce-bat-yam",
+      "send": "the activity name and typed arguments",
+      "recv": "a typed result, recorded in that run's event history",
+      "warn": "A workflow is REPLAYED from its history after a crash, so it must be\ndeterministic: the sandbox blocks network, clock and randomness, and it\nholds no credentials. Every outside call is an ACTIVITY, run by a worker\ninside the cluster it talks to. On replay the activity is not re-run; the\nrecorded result is read back.\n\nEvery arrow after this starts at a WORKER, never at Temporal."
     }
   ],
   [
@@ -254,49 +303,49 @@ const RAW   = [
     "seg",
     "both",
     "Resolve inventory VLAN",
-    "Runs on the segments queue, where that token lives.",
+    "On the segments queue, where that token lives.",
     {
       "call": "GET /api/segments?type=INVENTORY",
-      "recv": "{ \"items\": [ { \"segment\": \"10.20.90.0/24\", \"site\": \"bat-yam\",\n              \"vlan_id\": 23, \"type\": \"INVENTORY\",\n              \"cluster_name\": \"ocp4-prod-mce-bat-yam\" } ] }\n\nOnly vlan_id is used downstream.",
-      "warn": "There is no cluster filter, so the hub match is made client-side and is not\noptional. Re-check type too: a renamed filter would hand back another hub's\nVLAN with nothing to detect it. A 404 means the route is gone, not empty."
+      "recv": "match client-side on cluster_name == hub; take vlan_id",
+      "warn": "No cluster filter exists, so the hub match is made client-side and is not\noptional. Re-check the type too. Once per run, before any candidate."
     }
   ],
   [
     "hubw",
     "scan",
-    "BM",
+    "both",
     "Draw candidates",
-    "Healthy, unclaimed, not reserved. Pattern from hardware class.",
+    "Both pool types. Virtual machines are in the inventory too.",
     {
-      "call": "GET /servers/available?pattern=^ocp-cisco-m6-64c-512gb&count=3&health=HEALTHY",
-      "recv": "{ \"items\": [ {\n    \"id\": \"6712...\", \"name\": \"ocp-cisco-m6-bat-yam-64c-512gb-J3K9L2\",\n    \"bmc_vendor\": \"CISCO\",\n    \"bmc\": { \"host\": \"10.4.1.50\", \"scheme\": \"https\", \"port\": 443 },\n    \"interfaces\": [ { \"name\": \"eth0\", \"mac\": \"aa:bb:..\",\n                      \"location\": \"slot1-port1\", \"link_state\": \"UP\" } ],\n    \"nic_macs\": [ ... ],\n    \"site_id\": \"bat-yam\", \"health_overall\": \"HEALTHY\",\n    \"live_recheck_performed\": true } ],\n  \"mode\": \"pattern\", \"requested\": 3, \"returned\": 3 }",
-      "warn": "Bond members come from interfaces[], NEVER nic_macs[]. Partitioned cards\ncollapse to one entry per physical port in the first list and are left whole\nin the second, so indexing MACs bonds two partitions of one wire.\n\nNot a pure read: it live-rechecks each candidate against the vendor manager\nand writes the result back. A 503 means that recheck failed, NOT that\nnothing is available."
+      "call": "GET /servers/available?pattern=^ocp-<infra_env>&count=<candidate_count>&health=HEALTHY",
+      "recv": "items[]: id, name, bmc_vendor, bmc{...}, interfaces[...], nic_macs[],\n         site_id, health_overall, live_recheck_performed",
+      "warn": "Bond from interfaces[], NEVER nic_macs[]: partitioned cards collapse to one\nentry per port in the first and are left whole in the second.\n\nNot a pure read. It live-rechecks each candidate against the vendor manager\nand writes the result back. A 503 means that recheck failed, not that\nnothing is free."
     }
   ],
   [
     "kvw",
     "vm",
     "VM",
-    "Create the VM",
-    "On a different cluster, by a worker holding only that cluster's credentials.",
+    "Create a machine",
+    "Virtual pools only, and only when the draw came back empty.",
     {
       "call": "CREATE kubevirt.io/v1 VirtualMachine   (on the KV cluster's queue)",
-      "send": "spec.template.spec.domain.cpu/memory from the VM profile\nlabels: zone, node-type, pool",
-      "recv": "wait until status.ready, then read the interface MAC",
-      "warn": "BEING IMPLEMENTED. This is the one call that is not on the hub, which is why\nit runs on a different queue: no process holds credentials for a cluster it\ndoes not live in."
+      "send": "cores and memory from the node type; labels for zone, node type, pool",
+      "recv": "wait for running, then read the interface MAC",
+      "warn": "PLANNED. This is the ONE divergence between the two pool types: a virtual\npool can manufacture a machine, a bare-metal pool fails as pool-exhausted.\n\nOpen: which KV cluster. The controller sees only its own hub, so it cannot\nname one. Same gap as deciding when a cell is full.\n\nOpen: a new machine is invisible to the inventory until the collector sees\nit, so nothing can draw it and nothing can lock it either."
     }
   ],
   [
     "hubw",
     "scan",
-    "BM",
+    "both",
     "Reserve the machine",
-    "2h lease held by this workflow id. A retry extends it.",
+    "2h lease, holder is this run id.",
     {
       "call": "POST /servers/{id}/reservation          (needs an ADMIN token)",
-      "send": "{ \"holder\": \"add-server\",\n  \"mce_cluster\": \"ocp4-prod-mce-bat-yam\",\n  \"infra_env\": \"cisco-m6-64c-512gb\",\n  \"namespace\": \"openshift-machine-api\",\n  \"workflow_id\": \"add-server-cisco-m6-64c-512gb\",\n  \"ttl_seconds\": 7200 }",
-      "recv": "200 -> { \"expires_at\": \"...\" }    ttl bounded 300..86400",
-      "warn": "A 409 is TWO answers. With details.held_by another run owns it: permanent,\nskip this candidate. Without it you merely lost a revision race, often to a\ncollector: retryable. Conflating them either loops forever or abandons a\nmachine nobody took."
+      "send": "{ \"holder\": \"install-server\", \"mce_cluster\": ..., \"infra_env\": ...,\n  \"workflow_id\": \"install-server-<infra_env>_2\", \"ttl_seconds\": 7200 }",
+      "recv": "200 -> expires_at.  ttl bounded 300..86400",
+      "warn": "A 409 is TWO answers. With details.held_by a sibling run owns it: skip this\ncandidate. Without it you lost a revision race, often to a collector:\nretryable. This lock is what stops two slots taking one machine."
     }
   ],
   [
@@ -304,11 +353,11 @@ const RAW   = [
     "pxe",
     "IPMI",
     "Map the boot MAC",
-    "Blades have no virtual media, so they must PXE boot.",
+    "Blades have no virtual media, so they must PXE.",
     {
-      "call": "PUT /pxe-map/<boot-mac>                 (bearer, per-site base URL)",
-      "send": "{ \"infra_env\": { \"mce_cluster\": \"ocp4-prod-mce-bat-yam\",\n                  \"name\": \"cisco-m6-64c-512gb\" } }",
-      "warn": "The BOOT MAC only, which is bond member one and the same MAC the\nBareMetalHost boots from. Mapping both bond MACs breaks a blade whose\nfirmware PXE-boots from the other NIC."
+      "call": "PUT /pxe-map/<boot-mac>",
+      "send": "{ \"infra_env\": { \"mce_cluster\": ..., \"name\": ... } }",
+      "warn": "The BOOT MAC only, which is bond member one and the MAC the BareMetalHost\nboots from. Mapping both bond MACs breaks a blade whose firmware PXE-boots\nfrom the other NIC."
     }
   ],
   [
@@ -316,11 +365,11 @@ const RAW   = [
     "res",
     "both",
     "Write NMStateConfig",
-    "Bond with addressing off, VLAN sub-interface on DHCP.",
+    "First for IPMI, before anything can power the host on.",
     {
       "call": "CREATE agent-install.openshift.io/v1beta1 NMStateConfig",
-      "send": "interfaces:\n  - name: bond0           type: bond\n    ipv4: {enabled: false}        # no address on the bond\n    link-aggregation: {mode: 802.3ad, port: [nic1, nic2]}\n  - name: bond0.23        type: vlan\n    vlan: {base-iface: bond0, id: 23}\n    ipv4: {enabled: true, dhcp: true, auto-dns: true,\n           auto-gateway: true, auto-routes: true}\nlabels: {infraenvs.agent-install.openshift.io: cisco-m6-64c-512gb}",
-      "warn": "The VLAN sub-interface is the ONLY interface with an address, and it is\nleased, not assigned. The segment contributes the VLAN tag; the DHCP scope\ndecides the address."
+      "send": "bond0        type: bond   ipv4 {enabled: false}\nbond0.<vlan> type: vlan   ipv4 {enabled: true, dhcp: true,\n                                auto-dns/gateway/routes: true}\nlabels: {infraenvs.agent-install.openshift.io: <infra_env>}",
+      "warn": "The VLAN sub-interface is the ONLY interface with an address, and it is\nleased. The segment contributes the tag; the DHCP scope decides the address."
     }
   ],
   [
@@ -328,7 +377,7 @@ const RAW   = [
     "res",
     "both",
     "Write BMC Secret",
-    "Credentials never come from server-scan.",
+    "Credentials never come from the inventory.",
     {
       "call": "CREATE core/v1 Secret",
       "send": "stringData: { username: ..., password: ... }",
@@ -340,11 +389,11 @@ const RAW   = [
     "res",
     "both",
     "Write BareMetalHost",
-    "Points at the BMC. For a VM, its Redfish endpoint.",
+    "For a virtual machine, its Redfish endpoint.",
     {
       "call": "CREATE metal3.io/v1alpha1 BareMetalHost",
-      "send": "metadata:\n  labels:      {infraenvs.agent-install.openshift.io: cisco-m6-64c-512gb}\n  annotations: {inspect.metal3.io: disabled,\n                bmac.agent-install.openshift.io/hostname: <dns-cased>}\nspec:\n  online: true\n  bootMACAddress: <bond member 1>\n  customDeploy: {method: start_assisted_install}\n  automatedCleaningMode: disabled\n  bootMode: UEFI\n  bmc: {address: <driver>://<host>, credentialsName: <secret>,\n        disableCertificateVerification: true}",
-      "warn": "Create-if-absent with identity verification, NOT server-side apply. An\nexisting object is success once BMC address, boot MAC, InfraEnv and VLAN\nmatch, and a conflict for a human when they differ. Nothing is overwritten,\nso an operator's hand correction survives a re-run."
+      "send": "labels: {infraenvs.agent-install.openshift.io: <infra_env>}\nspec: online: true, bootMACAddress: <bond member 1>,\n      customDeploy: {method: start_assisted_install},\n      automatedCleaningMode: disabled, bootMode: UEFI,\n      bmc: {address, credentialsName, disableCertificateVerification}",
+      "warn": "Create-if-absent with identity verification, NOT server-side apply. An\nexisting object is success once BMC address, boot MAC, InfraEnv and VLAN\nmatch, and a conflict for a human when they differ. Nothing is ever\noverwritten, so an operator's hand correction survives a re-run."
     }
   ],
   [
@@ -352,11 +401,24 @@ const RAW   = [
     "ienv",
     "both",
     "Image regenerates",
-    "Must include this host's config, or it boots an older image.",
+    "Must include this host's config, or it boots an older one.",
     {
       "call": "GET agent-install.openshift.io/v1beta1 InfraEnv",
-      "recv": "status.conditions[type=ImageCreated].status\nstatus.createdTime\nstatus.bootArtifacts.ipxeScript",
-      "warn": "TWO conditions, not one. ImageCreated must be True, because it goes False\nwhen a generation FAILED and the message is the only place the cause\nappears. AND createdTime must be no older than this host's NMStateConfig\ncreationTimestamp. Checking only the timestamp passes an image made before\nthe failure; checking only the condition passes an image that predates\nthis host."
+      "recv": "status.conditions[ImageCreated].status\nstatus.createdTime\nstatus.bootArtifacts.ipxeScript",
+      "warn": "TWO conditions, not one. ImageCreated must be True, because it goes False\nwhen a generation FAILED and its message is the only place the cause\nappears. AND createdTime must be no older than this host's NMStateConfig.\nChecking only the timestamp passes an image made before the failure."
+    }
+  ],
+  [
+    "hubw",
+    "pxe",
+    "IPMI",
+    "Publish the boot entry",
+    "Only now the image includes this host.",
+    {
+      "call": "PUT /pxe-map/<mce_cluster>/<infra_env>",
+      "send": "{ \"ipxe_url\": ..., \"image_created_at\": ... }",
+      "recv": "409 means a NEWER image is already published: that is success",
+      "warn": "Distinct from mapping the MAC earlier. One entry per InfraEnv, not one per\nhost, so republishing a regenerated image is one write. Compare-and-set on\nimage_created_at, so a slow run can never roll an entry backwards."
     }
   ],
   [
@@ -366,56 +428,32 @@ const RAW   = [
     "Agent registers",
     "The only proof BMC, bond, VLAN and DHCP all worked.",
     {
-      "call": "LIST agent-install.openshift.io/v1beta1 Agent  (in the InfraEnv namespace)",
-      "recv": "match: metadata.labels['bmac.agent-install.openshift.io/bmh'] == <bmh name>\n   or: any MAC the Agent reports is one of this host's bond MACs\n\nspec.clusterDeploymentName  set -> claimed\n                            empty -> spare inventory",
-      "warn": "The MAC fallback is needed because an Agent is named after the machine's\nhardware UUID and its spec holds no reference back to the BareMetalHost.\nThat last field is the whole supply side of the controller's arithmetic."
+      "call": "LIST agent-install.openshift.io/v1beta1 Agent",
+      "recv": "match on the bmh label, or on any MAC the Agent reports\nspec.clusterDeploymentName empty -> it is spare inventory",
+      "warn": "An hour is budgeted, because bare metal POSTs for longer than a VM boots.\nThe MAC fallback exists because an Agent is named after a hardware UUID\nand holds no reference back to the BareMetalHost."
     }
   ],
   [
     "hubw",
     "scan",
-    "BM",
+    "both",
     "Hold for 24h",
-    "Until a cluster reports the machine as taken.",
+    "Until something reports the machine claimed.",
     {
       "call": "POST /servers/{id}/reservation   with ttl_seconds: 86400",
-      "warn": "Same workflow_id, so this EXTENDS the existing lease rather than racing it.\nThe hold exists because the inventory only learns a machine is taken when a\ncluster reports it, every 15 minutes."
+      "warn": "Same workflow id, so this EXTENDS the lease rather than racing it. Needed\nbecause the inventory only learns a machine is taken when a cluster reports\nit, every 15 minutes."
     }
   ],
   [
-    "hubw",
     "agt",
+    "ctl",
     "both",
-    "Count the pool",
-    "One list call, made by the hub's worker, not by Temporal.",
+    "Next pass sees it",
+    "No parent is waiting. The loop is the controller.",
     {
-      "call": "LIST agent-install.openshift.io/v1beta1 Agent\n  namespace: <infraenv namespace>\n  label:     infraenvs.agent-install.openshift.io=<infra_env>",
-      "recv": "assigned = those with spec.clusterDeploymentName set\nspare    = those with it empty",
-      "warn": "NOT from the inventory. It learns a machine is claimed from a job that runs\nevery 15 minutes, which is far too stale for this arithmetic. The Agent\nresource is the only current source of bound versus free."
-    }
-  ],
-  [
-    "hubw",
-    "tmp",
-    "both",
-    "Return the counts",
-    "Only data crosses back. Credentials stay in the worker.",
-    {
-      "call": "activity result  ->  workflow event history",
-      "recv": "{ \"assigned\": 14, \"spare\": 2 }",
-      "warn": "This is the boundary. The workflow receives NUMBERS, never a client, a\ntoken or a connection. Recorded in history, so a replay reads this result\nback instead of listing the hub again."
-    }
-  ],
-  [
-    "tmp",
-    "tmp",
-    "both",
-    "Recompute the gap",
-    "Pure workflow code. No I/O, so it replays identically.",
-    {
-      "call": "no call \u2014 deterministic workflow code",
-      "send": "needed = target - (assigned + spare + inFlight)\n       = 18     - (14       + 2     + 0)        = 2",
-      "warn": "inFlight is the workflow's OWN count of running children. It is not read\nfrom anywhere, which is exactly why the controller cannot compute this and\nthe workflow can.\n\nneeded <= 0 with no children running  ->  complete and exit; the next\nsignal starts a fresh run. Otherwise start min(needed, maxParallel)\nchildren and loop. maxParallel is 1 for bare metal, higher for virtual."
+      "call": "nothing \u2014 the run has completed and exited",
+      "recv": "the controller's next pass, within 2 minutes, lists Agents again",
+      "warn": "Nothing owns convergence, and that is deliberate. A failed slot simply\nleaves the gap open and the next pass notices. The evaluation cycle IS the\nretry, which is why there is no pool-level attempt counter."
     }
   ]
 ];

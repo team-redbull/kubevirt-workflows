@@ -111,65 +111,81 @@
 <script>
 const NODES = {
   "tmp": {
-    "x": 390,
-    "y": 18,
-    "w": 220,
-    "h": 50,
+    "x": 400,
+    "y": 16,
+    "w": 210,
+    "h": 46,
     "t": "Temporal",
-    "s": "remove-server-<infraenv>"
+    "s": "one run per machine"
   },
   "scan": {
-    "x": 800,
-    "y": 18,
-    "w": 170,
-    "h": 54,
+    "x": 815,
+    "y": 16,
+    "w": 165,
+    "h": 46,
     "t": "server-scan",
     "s": "fleet inventory"
   },
+  "kvw": {
+    "x": 812,
+    "y": 120,
+    "w": 156,
+    "h": 42,
+    "t": "KV worker",
+    "s": "PLANNED, same pattern"
+  },
+  "vm": {
+    "x": 812,
+    "y": 176,
+    "w": 156,
+    "h": 42,
+    "t": "VirtualMachine",
+    "s": "destroyed"
+  },
   "pxe": {
-    "x": 30,
-    "y": 130,
-    "w": 170,
-    "h": 54,
+    "x": 20,
+    "y": 252,
+    "w": 165,
+    "h": 46,
     "t": "PXE Host",
     "s": "per site"
   },
-  "vm": {
-    "x": 800,
-    "y": 148,
-    "w": 170,
-    "h": 54,
-    "t": "Virtual Machine",
-    "s": "destroyed"
+  "hubw": {
+    "x": 265,
+    "y": 292,
+    "w": 215,
+    "h": 48,
+    "t": "server-lifecycle worker",
+    "s": "the hub's own SA"
   },
   "ctl": {
-    "x": 266,
-    "y": 312,
-    "w": 204,
+    "x": 505,
+    "y": 292,
+    "w": 240,
     "h": 48,
     "t": "Inventory Controller",
     "s": "in-cluster"
   },
-  "res": {
-    "x": 500,
-    "y": 312,
-    "w": 234,
-    "h": 48,
-    "t": "BMH + NMState",
-    "s": "+ BMC Secret"
-  },
   "agt": {
-    "x": 266,
-    "y": 384,
-    "w": 204,
+    "x": 265,
+    "y": 372,
+    "w": 215,
     "h": 46,
     "t": "Agent",
     "s": "must be unbound"
   },
+  "res": {
+    "x": 505,
+    "y": 372,
+    "w": 240,
+    "h": 46,
+    "t": "BMH + NMState",
+    "s": "+ BMC Secret"
+  },
   "gone": {
-    "x": 500,
-    "y": 384,
-    "w": 234,
+    "x": 350,
+    "y": 452,
+    "w": 300,
     "h": 46,
     "t": "Verified gone",
     "s": "nothing survives"
@@ -177,78 +193,126 @@ const NODES = {
 };
 const GROUPS = [
   {
-    "x": 778,
-    "y": 110,
-    "w": 214,
-    "h": 116,
+    "x": 795,
+    "y": 86,
+    "w": 190,
+    "h": 150,
     "label": "KV CLUSTER"
   },
   {
     "x": 240,
-    "y": 270,
-    "w": 520,
-    "h": 200,
-    "label": "MCE HUB  \u00b7  controller and worker run in-cluster"
+    "y": 250,
+    "w": 530,
+    "h": 290,
+    "label": "MCE HUB"
   }
 ];
 const RAW   = [
   [
     "ctl",
-    "tmp",
-    "both",
-    "Signal lower target",
-    "Above ceiling, sustained through the cooldown.",
-    {
-      "call": "Temporal SignalWithStart",
-      "send": "workflow_id : remove-server-cisco-m6-64c-512gb\nsignal      : setTarget\npayload     : { \"target_total\": 9 }",
-      "warn": "Only fires when total > demand + highPct, held for the whole cooldown. A\ntenant scaling down does NOT come here: those agents just unbind."
-    }
-  ],
-  [
-    "tmp",
     "agt",
     "both",
-    "Pick an unbound agent",
-    "Prefer the longest idle. None selectable is a clean no-op.",
+    "Count the pool",
+    "Same read as adding. The controller looks.",
     {
       "call": "LIST agent-install.openshift.io/v1beta1 Agent",
-      "recv": "filter: spec.clusterDeploymentName is empty\norder:  longest idle first",
-      "warn": "Never pick a bound agent. It is carrying a tenant workload."
+      "recv": "assigned = 20,  spare = 6,  total = 26",
+      "warn": "A machine being torn down is STILL an Agent until the teardown finishes, so\nit is counted here. That is why the next step exists."
+    }
+  ],
+  [
+    "ctl",
+    "tmp",
+    "both",
+    "Ask which removals are open",
+    "The mirror of the in-flight problem.",
+    {
+      "call": "Temporal: list open workflows matching remove-server-*",
+      "recv": "map each run's machine back to a pool, by its name",
+      "warn": "Without this the controller over-removes. A removal in flight leaves its\nagent visible as spare, so the next pass sees the same surplus and picks a\nDIFFERENT machine to remove. Two minutes later, another.\n\nHarder than the add side: a removal id is remove-server-<machine>, keyed on\nthe machine rather than the pool, so you cannot match by id pattern. The\nmapping is by machine name."
+    }
+  ],
+  [
+    "ctl",
+    "ctl",
+    "both",
+    "Compute the surplus",
+    "Above the ceiling, and held there.",
+    {
+      "call": "no call \u2014 the controller's own arithmetic",
+      "send": "ceiling = demand + high      = 20 + 4 = 24\nsurplus = total - removing - ceiling\n        = 26    - 0        - 24       = 2",
+      "warn": "Only fires above the CEILING, not below the target, and only after the\nsurplus has persisted for the whole cooldown. Grow fast, shrink slowly:\nshrinking late wastes a little capacity, growing late stalls a tenant.\n\nNever shrink below target. The target is a floor as well as a ceiling."
+    }
+  ],
+  [
+    "ctl",
+    "agt",
+    "both",
+    "Pick the victims",
+    "Unbound only, longest idle first.",
+    {
+      "call": "filter the Agents already listed",
+      "recv": "spec.clusterDeploymentName empty, and no removal already open for it",
+      "warn": "Never pick a bound agent: it is carrying a tenant workload. Never pick one\nmid-scrub either, which is the same rule that keeps a scrubbing machine out\nof the spare count."
+    }
+  ],
+  [
+    "ctl",
+    "tmp",
+    "both",
+    "Start one run per machine",
+    "No slots needed here.",
+    {
+      "call": "POST /workflows/server-lifecycle/remove-server   (once per machine)",
+      "send": "{ \"server_name\": \"ocp-cisco-m6-bat-yam-64c-512gb-J3K9L2\",\n  \"mce_cluster\": \"ocp4-prod-mce-bat-yam\" }",
+      "recv": "202 per call, or 409 if a removal for that machine is already in flight",
+      "warn": "Unlike adding, the id is remove-server-<machine>, so N removals are N\ndistinct ids and run in parallel by construction. No slot mechanism is\nneeded, and a repeat for the same machine deduplicates for free.\n\nThe distinct prefix also keeps a removal from colliding with an install of\nthe same machine."
     }
   ],
   [
     "tmp",
+    "hubw",
+    "both",
+    "Each run dispatches to the hub",
+    "From here on, one run, one machine.",
+    {
+      "call": "ExecuteActivity  ->  queue server-lifecycle-activity-ocp4-prod-mce-bat-yam",
+      "warn": "The workflow holds no credentials and makes no calls; it is replayed from\nhistory and must be deterministic. Every arrow below starts at a worker."
+    }
+  ],
+  [
+    "hubw",
     "agt",
     "both",
     "Re-check it is unbound",
-    "A NodePool can claim it at any instant. This is the race.",
+    "The race, and the last chance to catch it.",
     {
       "call": "GET agent-install.openshift.io/v1beta1 Agent/<name>",
       "recv": "spec.clusterDeploymentName must STILL be empty",
-      "warn": "Read it again immediately before the destructive step. The gap between\nselecting and destroying is exactly where a NodePool can claim it."
+      "warn": "Read it again immediately before the destructive step. The controller\nchose this machine seconds or minutes ago; a NodePool can claim it at any\ninstant in between."
     }
   ],
   [
-    "tmp",
+    "hubw",
     "res",
     "both",
     "Detach the host",
-    "Before any delete, or the finalizer blocks forever.",
+    "Before any delete. This one is load-bearing.",
     {
       "call": "PATCH metal3.io/v1alpha1 BareMetalHost/<name>",
       "send": "metadata.annotations:\n  baremetalhost.metal3.io/detached: \"\"",
-      "warn": "This is the load-bearing step. Delete first and Metal3's finalizer tries to\ndeprovision through a BMC that is no longer answering, and blocks forever.\nMeasured at 14 hours with no error reported."
+      "warn": "Delete first and Metal3's finalizer tries to deprovision through a BMC that\nis no longer answering, and blocks forever. Measured at 14 hours with no\nerror reported."
     }
   ],
   [
-    "tmp",
+    "hubw",
     "res",
     "both",
     "Delete NMState, BMH, Secret",
     "In that order. A missing object is success.",
     {
       "call": "DELETE NMStateConfig, then BareMetalHost, then Secret",
-      "recv": "404 on any of them is success, not an error",
+      "recv": "404 on any of them is success",
       "warn": "A successful delete call does NOT mean the object is gone; finalizers can\nhold it. Confirming is the next two steps' job."
     }
   ],
@@ -260,66 +324,67 @@ const RAW   = [
     "Only metal3's. Never the whole list.",
     {
       "call": "PATCH BareMetalHost finalizers, after a bounded wait",
-      "send": "remove only: baremetalhost.metal3.io\nleave every other finalizer in place",
-      "warn": "Clearing the whole list strips finalizers belonging to other controllers\nand leaks whatever they were protecting."
+      "send": "remove only: baremetalhost.metal3.io",
+      "warn": "Clearing the whole list strips finalizers belonging to other controllers and\nleaks whatever they were protecting."
     }
   ],
   [
-    "tmp",
+    "hubw",
     "gone",
     "both",
     "Verify all three gone",
-    "Anything surviving is a retryable failure.",
+    "Verification ends the run, not the deletes.",
     {
       "call": "GET each of the three",
       "recv": "all three must 404",
-      "warn": "The machine is NOT returned to inventory while a BareMetalHost still points\nat it. Verification, not the delete calls, decides the run is done."
+      "warn": "The machine is NOT returned to inventory while a BareMetalHost still points\nat it."
     }
   ],
   [
-    "tmp",
+    "hubw",
     "pxe",
     "IPMI",
     "Unmap the boot MAC",
     "Mirror of the mapping on the way in.",
     {
       "call": "DELETE /pxe-map/<boot-mac>",
-      "recv": "404 is success"
+      "recv": "404 is success",
+      "warn": "Only its own site's PXE host. A removal does not touch the others."
     }
   ],
   [
-    "tmp",
+    "kvw",
     "vm",
     "VM",
-    "Delete the VM",
-    "Releases hypervisor CPU, memory and storage.",
+    "Delete the machine",
+    "On the KV cluster, by that cluster's worker.",
     {
-      "call": "DELETE kubevirt.io/v1 VirtualMachine   (on the KV cluster's queue)",
-      "warn": "BEING IMPLEMENTED. With no overcommit at the hypervisor layer, this is what\nactually returns the CPU and memory; until it runs they stay reserved."
+      "call": "DELETE kubevirt.io/v1 VirtualMachine",
+      "warn": "PLANNED. With no overcommit at the hypervisor layer this is what actually\nreturns the CPU and memory; until it runs they stay reserved for a guest\nthat no longer exists."
     }
   ],
   [
-    "tmp",
+    "hubw",
     "scan",
-    "BM",
+    "both",
     "Release the lock",
-    "No endpoint sets a machine available; the status job notices.",
+    "And then wait, because you cannot push the rest.",
     {
       "call": "DELETE /servers/{id}/reservation",
       "send": "{ \"holder\": \"remove-server\", \"workflow_id\": \"...\" }",
-      "warn": "There is NO endpoint that marks a server available. A status job on the hub\nnotices the Agent has gone, every 15 minutes, and sets it. You cannot push\nit, so do not design a step that tries."
+      "warn": "There is NO endpoint that marks a machine available again. A status job on\nthe hub notices the Agent has gone, every 15 minutes, and sets it. Do not\ndesign a step that tries to push it."
     }
   ],
   [
     "gone",
     "ctl",
     "both",
-    "Re-read, loop or stop",
-    "Still above target? Go again. Else complete.",
+    "Next pass sees it",
+    "No parent is waiting. The loop is the controller.",
     {
-      "call": "LIST NodePool + Agent on this hub   (in-cluster)",
-      "recv": "total = assigned + spare + building",
-      "warn": "Never shrink below target. The target is a floor as well as a ceiling."
+      "call": "nothing \u2014 the run has completed and exited",
+      "recv": "the controller's next pass, within 2 minutes, counts the pool again",
+      "warn": "Nothing owns convergence, deliberately. A failed removal leaves the surplus\nin place and the next pass notices. The evaluation cycle IS the retry."
     }
   ]
 ];
